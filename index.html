@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>오버워치 2 매칭 시스템</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #1f2937; }
+        ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #f97316; }
+    </style>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen font-sans">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        const TIERS = ['브론즈', '실버', '골드', '플래티넘', '에메랄드', '다이아몬드', '마스터', '그랜드마스터', '챔피언'];
+        const DIVISIONS = [5, 4, 3, 2, 1];
+        const ROLES = ['탱커', '딜러', '힐러'];
+        const ROLE_LIMITS = { '탱커': 1, '딜러': 2, '힐러': 2 };
+
+        const getScore = (tierIndex, division) => (tierIndex * 5) + (6 - division);
+        
+        const getTierName = (score) => {
+            if (score === 0) return '언랭크 (미배치)';
+            const tIndex = Math.floor((score - 1) / 5);
+            const div = 6 - (score - (tIndex * 5));
+            return `${TIERS[tIndex]} ${div}`;
+        };
+
+        const IconTank = () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>;
+        const IconDPS = () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="22" y1="12" x2="18" y2="12"></line><line x1="6" y1="12" x2="2" y2="12"></line><line x1="12" y1="6" x2="12" y2="2"></line><line x1="12" y1="22" x2="12" y2="18"></line></svg>;
+        const IconHeal = () => <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 5v14"></path><path d="M5 12h14"></path></svg>;
+
+        const App = () => {
+            const [players, setPlayers] = useState(() => {
+                try {
+                    const saved = localStorage.getItem('ow-squad-v9');
+                    if (saved) return JSON.parse(saved);
+                } catch (error) {
+                    console.error('로컬 스토리지 접근 실패:', error);
+                }
+                
+                return Array.from({ length: 5 }).map((_, i) => ({
+                    id: Date.now() + i,
+                    name: `플레이어 ${i + 1}`,
+                    isActive: true,
+                    roles: { 탱커: true, 딜러: true, 힐러: true },
+                    ranks: {
+                        탱커: { isUnranked: false, tier: 4, div: 3 }, 
+                        딜러: { isUnranked: false, tier: 4, div: 3 },
+                        힐러: { isUnranked: false, tier: 4, div: 3 }
+                    }
+                }));
+            });
+
+            const [combinations, setCombinations] = useState([]);
+            const [currentIndex, setCurrentIndex] = useState(0);
+            const [showResults, setShowResults] = useState(false);
+            
+            const [isCalculating, setIsCalculating] = useState(false);
+            const [progress, setProgress] = useState(0);
+            const [groupMode, setGroupMode] = useState(2); // 2그룹/3그룹 토글 상태 추가
+            
+            const [saveStatus, setSaveStatus] = useState('');
+            const fileInputRef = useRef(null);
+
+            useEffect(() => {
+                try {
+                    localStorage.setItem('ow-squad-v9', JSON.stringify(players));
+                    setSaveStatus('자동 저장됨');
+                    const timer = setTimeout(() => setSaveStatus(''), 2000);
+                    return () => clearTimeout(timer);
+                } catch (error) {
+                    setSaveStatus('저장 불가');
+                }
+            }, [players]);
+
+            const handleExport = () => {
+                try {
+                    const dataStr = JSON.stringify(players, null, 2);
+                    const blob = new Blob([dataStr], { type: "application/json" });
+                    const url = URL.createObjectURL(blob);
+                    
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.download = "ow_roster_backup.json";
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                    URL.revokeObjectURL(url);
+                } catch (err) {
+                    alert('파일 생성 중 오류가 발생했습니다.');
+                }
+            };
+
+            const handleReset = () => {
+                setShowResults(false);
+                setCombinations([]);
+                setCurrentIndex(0);
+                setProgress(0);
+            };
+
+            const handleImport = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    try {
+                        const imported = JSON.parse(event.target.result);
+                        if (Array.isArray(imported) && imported.length > 0) {
+                            const sanitized = imported.map((p, idx) => ({
+                                id: p.id || Date.now() + idx,
+                                name: p.name || `유저 ${idx + 1}`,
+                                isActive: p.isActive !== undefined ? p.isActive : true,
+                                roles: p.roles || { 탱커: true, 딜러: true, 힐러: true },
+                                ranks: {
+                                    탱커: p.ranks?.탱커 || { isUnranked: false, tier: 3, div: 5 },
+                                    딜러: p.ranks?.딜러 || { isUnranked: false, tier: 3, div: 5 },
+                                    힐러: p.ranks?.힐러 || { isUnranked: false, tier: 3, div: 5 }
+                                }
+                            }));
+                            
+                            setPlayers([...sanitized]);
+                            handleReset();
+                            alert(`✅ 총 ${sanitized.length}명의 명단을 성공적으로 불러왔습니다.`);
+                        } else {
+                            alert('❌ 올바른 백업 파일이 아니거나 데이터가 비어있습니다.');
+                        }
+                    } catch (err) {
+                        alert('❌ 파일을 읽는 중 오류가 발생했습니다. (잘못된 형식)');
+                    } finally {
+                        e.target.value = ''; 
+                    }
+                };
+                reader.readAsText(file);
+            };
+
+            const addPlayer = () => {
+                setPlayers([...players, {
+                    id: Date.now(),
+                    name: `신규 유저`,
+                    isActive: true,
+                    roles: { 탱커: true, 딜러: true, 힐러: true },
+                    ranks: {
+                        탱커: { isUnranked: false, tier: 3, div: 5 },
+                        딜러: { isUnranked: false, tier: 3, div: 5 },
+                        힐러: { isUnranked: false, tier: 3, div: 5 }
+                    }
+                }]);
+                // 신규 유저 추가 시 매칭 결과 자동 초기화
+                handleReset();
+            };
+
+            const removePlayer = (id) => setPlayers(players.filter(p => p.id !== id));
+            const updatePlayer = (id, field, value) => setPlayers(players.map(p => p.id === id ? { ...p, [field]: value } : p));
+            const updateRank = (id, role, field, value) => {
+                setPlayers(players.map(p => p.id === id ? { ...p, ranks: { ...p.ranks, [role]: { ...p.ranks[role], [field]: value } } } : p));
+            };
+            const toggleRole = (id, role) => {
+                setPlayers(players.map(p => p.id === id ? { ...p, roles: { ...p.roles, [role]: !p.roles[role] } } : p));
+            };
+
+            // 그룹 분할 로직 수정 (토글 옵션 반영)
+            const getGroupSizes = (n) => {
+                if (n <= 3) return [n];
+                if (n === 4) return [2, 2];
+                if (n === 5) return [5];
+                
+                // 토글(groupMode)에 따라 6~10명 그룹 분할 유동적 변경
+                if (n === 6) return groupMode === 3 ? [2, 2, 2] : [3, 3];
+                if (n === 7) return groupMode === 3 ? [3, 2, 2] : [5, 2];
+                if (n === 8) return groupMode === 3 ? [3, 3, 2] : [5, 3];
+                if (n === 9) return groupMode === 3 ? [3, 3, 3] : [5, 4];
+                if (n === 10) return groupMode === 3 ? [4, 3, 3] : [5, 5];
+                
+                // 11명 이상: 3그룹 이상으로 분할 고정
+                let sizes = [];
+                let remain = n;
+                
+                while (remain > 15) {
+                    sizes.push(5);
+                    remain -= 5;
+                }
+                
+                if (remain === 15) sizes.push(5, 5, 5);
+                else if (remain === 14) sizes.push(5, 5, 4);
+                else if (remain === 13) sizes.push(5, 4, 4);
+                else if (remain === 12) sizes.push(4, 4, 4);
+                else if (remain === 11) sizes.push(4, 4, 3);
+                
+                return sizes;
+            };
+
+            const assignRoles = (members) => {
+                let bestAssignment = null;
+                let minTierDiff = 9999;
+
+                const backtrack = (index, currentAssignment, roleCounts) => {
+                    if (index === members.length) {
+                        const scores = currentAssignment.map(a => a.score).filter(s => s > 0);
+                        const diff = scores.length > 0 ? Math.max(...scores) - Math.min(...scores) : 0;
+                        if (diff < minTierDiff) {
+                            minTierDiff = diff;
+                            bestAssignment = [...currentAssignment];
+                        }
+                        return;
+                    }
+
+                    const p = members[index];
+                    let assigned = false;
+                    for (const role of ROLES) {
+                        if (p.roles[role] && roleCounts[role] < ROLE_LIMITS[role]) {
+                            roleCounts[role]++;
+                            const rankData = p.ranks[role];
+                            const score = rankData.isUnranked ? 0 : getScore(rankData.tier, rankData.div);
+                            currentAssignment.push({ player: p, assignedRole: role, score });
+                            backtrack(index + 1, currentAssignment, roleCounts);
+                            currentAssignment.pop();
+                            roleCounts[role]--;
+                            assigned = true;
+                        }
+                    }
+                    
+                    if (!assigned) {
+                        currentAssignment.push({ player: p, assignedRole: '포지션 불가', score: 0 });
+                        backtrack(index + 1, currentAssignment, roleCounts);
+                        currentAssignment.pop();
+                    }
+                };
+
+                backtrack(0, [], { '탱커': 0, '딜러': 0, '힐러': 0 });
+                return bestAssignment;
+            };
+
+            const calculateGroups = () => {
+                const active = players.filter(p => p.isActive);
+                if (active.length < 2) return alert('최소 2명 이상의 참가자가 활성화되어야 합니다.');
+
+                setIsCalculating(true);
+                setShowResults(false);
+                setProgress(0);
+
+                setTimeout(() => {
+                    try {
+                        const sizes = getGroupSizes(active.length);
+                        
+                        const getAvgScore = (p) => {
+                            let total = 0, count = 0;
+                            ROLES.forEach(r => {
+                                if (p.roles[r] && !p.ranks[r].isUnranked) {
+                                    total += getScore(p.ranks[r].tier, p.ranks[r].div);
+                                    count++;
+                                }
+                            });
+                            return count === 0 ? 0 : total / count;
+                        };
+
+                        const MAX_ITERATIONS = 300; 
+                        const CHUNK_SIZE = 30; 
+                        const uniqueCombos = new Map();
+                        const sortedActive = [...active].sort((a, b) => getAvgScore(b) - getAvgScore(a));
+
+                        let currentIteration = 0;
+
+                        const processChunk = () => {
+                            try {
+                                let chunkCounter = 0;
+                                while (chunkCounter < CHUNK_SIZE && currentIteration < MAX_ITERATIONS) {
+                                    let shuffled = [...active];
+                                    if (currentIteration === 0) {
+                                        shuffled = sortedActive; 
+                                    } else {
+                                        shuffled.sort(() => Math.random() - 0.5); 
+                                    }
+
+                                    let currentIndex = 0;
+                                    const groups = [];
+                                    let comboKeyArr = [];
+                                    let totalWide = 0, totalDiff = 0, totalConflicts = 0;
+
+                                    sizes.forEach(size => {
+                                        const members = shuffled.slice(currentIndex, currentIndex + size);
+                                        const assignment = assignRoles(members);
+                                        
+                                        const memberIds = members.map(m => m.id).sort().join('-');
+                                        comboKeyArr.push(memberIds);
+
+                                        let minScore = 999, maxScore = -1;
+                                        let hasChampion = false, hasUnranked = false, hasConflict = false;
+
+                                        assignment.forEach(a => {
+                                            if (a.assignedRole === '포지션 불가') hasConflict = true;
+                                            if (a.score === 0 && a.assignedRole !== '포지션 불가') hasUnranked = true;
+                                            if (a.score > 0) {
+                                                if (a.score > maxScore) maxScore = a.score;
+                                                if (a.score < minScore) minScore = a.score;
+                                                if (a.score >= 36) hasChampion = true; 
+                                            }
+                                        });
+
+                                        const diff = maxScore !== -1 ? maxScore - minScore : 0;
+                                        let isWide = false;
+                                        let reason = '';
+
+                                        if (hasConflict) {
+                                            isWide = true; reason = '그룹 내 포지션 충돌 발생';
+                                        } else if (hasUnranked) {
+                                            isWide = true; reason = '언랭크 인원 포함';
+                                        } else if (hasChampion && size > 2) {
+                                            isWide = true; reason = '챔피언은 솔로/듀오만 좁은그룹 가능';
+                                        } else if (maxScore >= 26) { 
+                                            if (diff > 3) { isWide = true; reason = `마스터 이상 허용 격차(3) 초과`; }
+                                        } else {
+                                            if (diff > 5) { isWide = true; reason = `허용 티어 격차(5) 초과`; }
+                                        }
+
+                                        groups.push({ size, members: assignment, isWide, reason, minScore, maxScore });
+                                        totalWide += isWide ? 1 : 0;
+                                        totalDiff += diff;
+                                        if (hasConflict) totalConflicts += 1;
+
+                                        currentIndex += size;
+                                    });
+
+                                    const comboKey = comboKeyArr.sort().join('|');
+                                    if (!uniqueCombos.has(comboKey)) {
+                                        uniqueCombos.set(comboKey, { groups, totalWide, totalDiff, totalConflicts });
+                                    }
+                                    
+                                    currentIteration++;
+                                    chunkCounter++;
+                                }
+
+                                const currentProgress = Math.floor((currentIteration / MAX_ITERATIONS) * 100);
+                                setProgress(currentProgress);
+
+                                if (currentIteration < MAX_ITERATIONS) {
+                                    requestAnimationFrame(processChunk);
+                                } else {
+                                    const validCombinations = Array.from(uniqueCombos.values());
+                                    validCombinations.sort((a, b) => {
+                                        if (a.totalConflicts !== b.totalConflicts) return a.totalConflicts - b.totalConflicts;
+                                        if (a.totalWide !== b.totalWide) return a.totalWide - b.totalWide;
+                                        return a.totalDiff - b.totalDiff;
+                                    });
+
+                                    setIsCalculating(false); 
+
+                                    if (validCombinations.length === 0) {
+                                        alert('유효한 조합을 찾을 수 없습니다.');
+                                        return;
+                                    }
+
+                                    setCombinations(validCombinations);
+                                    setCurrentIndex(0);
+                                    setShowResults(true);
+                                }
+                            } catch (err) {
+                                console.error(err);
+                                alert(`탐색 중 치명적인 오류가 발생했습니다.\n상세: ${err.message}`);
+                                setIsCalculating(false);
+                            }
+                        };
+
+                        requestAnimationFrame(processChunk);
+
+                    } catch (err) {
+                        alert(`초기화 중 오류가 발생했습니다.\n상세: ${err.message}`);
+                        setIsCalculating(false);
+                    }
+                }, 100);
+            };
+
+            const handleReroll = () => {
+                if (currentIndex < combinations.length - 1) {
+                    setCurrentIndex(prev => prev + 1);
+                } else {
+                    alert('더 이상 탐색된 대체 조합이 없습니다. 첫 번째(가장 최적화된) 조합으로 돌아갑니다.');
+                    setCurrentIndex(0);
+                }
+            };
+
+            return (
+                <div className="max-w-7xl mx-auto p-6">
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8 border-b border-slate-700 pb-4">
+                        <div className="flex items-center gap-4">
+                            <h1 className="text-3xl font-bold text-orange-500 tracking-tight">OVERWATCH 2 다인큐 그룹 조합 만들기</h1>
+                            <span className="text-slate-400 text-sm mt-2 hidden md:block">designed by KAKY</span>
+                        </div>
+                        
+                        <div className="flex items-center gap-3">
+                            <span className="text-xs text-emerald-400 font-bold mr-2">{saveStatus}</span>
+                            <input type="file" accept=".json" onChange={handleImport} ref={fileInputRef} className="hidden" />
+                            <button onClick={() => fileInputRef.current.click()} className="bg-slate-700 hover:bg-slate-600 px-3 py-2 rounded text-sm font-semibold transition-colors border border-slate-500">
+                                불러오기
+                            </button>
+                            <button onClick={handleExport} className="bg-slate-700 hover:bg-slate-600 px-3 py-2 rounded text-sm font-semibold transition-colors border border-slate-500">
+                                백업 다운로드
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                        <div className="lg:col-span-7 xl:col-span-8 bg-slate-800 rounded-lg border border-slate-700 shadow-lg flex flex-col h-[80vh]">
+                            <div className="p-4 bg-slate-800/80 border-b border-slate-700 flex justify-between items-center shrink-0">
+                                <h2 className="text-lg font-bold">플레이어 관리 ({players.filter(p=>p.isActive).length}명 참가)</h2>
+                                <div className="flex items-center gap-3">
+                                    <div className="flex bg-slate-900 rounded p-1 border border-slate-700">
+                                        <button 
+                                            onClick={() => { setGroupMode(2); handleReset(); }} 
+                                            disabled={isCalculating}
+                                            className={`px-3 py-1.5 text-xs font-bold rounded transition-colors ${groupMode === 2 ? 'bg-slate-700 text-white' : 'text-slate-500 hover:text-slate-300'}`}
+                                        >
+                                            2그룹 분할
+                                        </button>
+                                        <button 
+                                            onClick={() => { setGroupMode(3); handleReset(); }} 
+                                            disabled={isCalculating}
+                                            className={`px-3 py-1.5 text-xs font-bold rounded transition-colors ${groupMode === 3 ? 'bg-slate-700 text-white' : 'text-slate-500 hover:text-slate-300'}`}
+                                        >
+                                            3그룹 분할
+                                        </button>
+                                    </div>
+                                    <button onClick={addPlayer} className="bg-orange-600 hover:bg-orange-500 px-4 py-2 rounded text-sm font-semibold transition-colors" disabled={isCalculating}>
+                                        + 인원 추가
+                                    </button>
+                                </div>
+                            </div>
+                            
+                            <div className="p-4 space-y-3 overflow-y-auto grow">
+                                {[...players].sort((a, b) => Number(b.isActive) - Number(a.isActive)).map(player => (
+                                    <div key={player.id} className={`p-4 rounded border ${player.isActive ? 'bg-slate-750 border-slate-600' : 'bg-slate-900 border-slate-800 opacity-50'}`}>
+                                        <div className="flex flex-col xl:flex-row gap-4 items-start xl:items-center">
+                                            <div className="flex items-center gap-3 min-w-[180px]">
+                                                <input type="checkbox" checked={player.isActive} onChange={() => updatePlayer(player.id, 'isActive', !player.isActive)} disabled={isCalculating} className="w-5 h-5 accent-orange-500 cursor-pointer" />
+                                                <input type="text" value={player.name} onChange={(e) => updatePlayer(player.id, 'name', e.target.value)} disabled={isCalculating} className="bg-slate-900 border border-slate-600 rounded px-3 py-1.5 w-full font-bold focus:border-orange-500 focus:outline-none" />
+                                            </div>
+
+                                            <div className="flex-1 grid grid-cols-1 md:grid-cols-3 gap-2 w-full">
+                                                {ROLES.map((role, idx) => {
+                                                    const icons = [<IconTank/>, <IconDPS/>, <IconHeal/>];
+                                                    const colors = ['text-blue-400', 'text-red-400', 'text-emerald-400'];
+                                                    
+                                                    return (
+                                                        <div key={role} className={`flex flex-col gap-2 p-2 rounded border ${player.roles[role] ? 'bg-slate-900/50 border-slate-600' : 'bg-slate-900/20 border-slate-800'}`}>
+                                                            <div className="flex items-center gap-2">
+                                                                <button onClick={() => toggleRole(player.id, role)} disabled={isCalculating} className={`p-1 rounded ${player.roles[role] ? colors[idx] : 'text-slate-600 hover:text-slate-400'}`}>
+                                                                    {icons[idx]}
+                                                                </button>
+                                                                <label className="text-xs text-slate-400 flex items-center gap-1 cursor-pointer">
+                                                                    <input type="checkbox" checked={player.ranks[role].isUnranked} disabled={isCalculating} onChange={(e) => updateRank(player.id, role, 'isUnranked', e.target.checked)} className="accent-orange-500" />
+                                                                    언랭/미배치
+                                                                </label>
+                                                            </div>
+                                                            {player.roles[role] && !player.ranks[role].isUnranked && (
+                                                                <div className="flex gap-1">
+                                                                    <select value={player.ranks[role].tier} onChange={(e) => updateRank(player.id, role, 'tier', Number(e.target.value))} disabled={isCalculating} className="bg-slate-900 border border-slate-700 rounded p-1 text-xs w-full focus:outline-none">
+                                                                        {TIERS.map((t, i) => <option key={i} value={i}>{t}</option>)}
+                                                                    </select>
+                                                                    <select value={player.ranks[role].div} onChange={(e) => updateRank(player.id, role, 'div', Number(e.target.value))} disabled={isCalculating} className="bg-slate-900 border border-slate-700 rounded p-1 text-xs focus:outline-none">
+                                                                        {DIVISIONS.map(d => <option key={d} value={d}>{d}</option>)}
+                                                                    </select>
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    )
+                                                })}
+                                            </div>
+                                            <button onClick={() => removePlayer(player.id)} disabled={isCalculating} className="text-slate-500 hover:text-red-400 p-2 ml-auto text-xl font-bold">✕</button>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+
+                        <div className="lg:col-span-5 xl:col-span-4 flex flex-col gap-4 h-[80vh]">
+                            {!isCalculating && (
+                                !showResults ? (
+                                    <button onClick={calculateGroups} className="w-full bg-orange-600 hover:bg-orange-500 font-bold py-4 rounded-lg text-lg transition-colors shrink-0 shadow-lg">
+                                        최적의 매칭 조합 탐색하기
+                                    </button>
+                                ) : (
+                                    <div className="flex gap-2 shrink-0">
+                                        <button onClick={handleReroll} className="flex-1 bg-indigo-600 hover:bg-indigo-500 font-bold py-4 rounded-lg text-lg transition-colors shadow-lg flex items-center justify-center gap-2">
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.59-11.45l5.25 5.25"/></svg>
+                                            리롤하기
+                                        </button>
+                                        <button onClick={handleReset} className="w-1/3 bg-slate-600 hover:bg-slate-500 font-bold py-4 rounded-lg text-lg transition-colors shadow-lg">
+                                            초기화
+                                        </button>
+                                    </div>
+                                )
+                            )}
+
+                            <div className="overflow-y-auto grow space-y-6 pr-2">
+                                {isCalculating ? (
+                                    <div className="flex flex-col items-center justify-center h-full border-2 border-slate-700 rounded-xl bg-slate-800/30 p-8 space-y-6">
+                                        <div className="text-xl font-bold text-orange-400 animate-pulse">최적의 조합을 탐색 중입니다...</div>
+                                        <div className="w-full bg-slate-700 rounded-full h-4">
+                                            <div className="bg-orange-500 h-4 rounded-full transition-all duration-200" style={{ width: `${progress}%` }}></div>
+                                        </div>
+                                        <div className="text-slate-400 font-bold">{progress}% 완료</div>
+                                        <div className="text-xs text-slate-500">조합 경우의 수를 계산하고 있습니다.</div>
+                                    </div>
+                                ) : (
+                                    showResults && combinations.length > 0 ? (
+                                        (() => {
+                                            const combo = combinations[currentIndex];
+                                            return (
+                                                <div className="bg-slate-800/60 p-4 rounded-xl border border-slate-600 relative shadow-md">
+                                                    <div className="mb-4 flex items-center justify-between">
+                                                        <div className="flex items-center gap-3">
+                                                            <h3 className="text-xl font-black italic text-orange-400">옵션 {currentIndex + 1}</h3>
+                                                            {currentIndex === 0 && <span className="bg-orange-600 text-white text-xs px-2 py-0.5 rounded font-bold">Best 추천</span>}
+                                                        </div>
+                                                        <span className="text-xs text-slate-400 bg-slate-700 px-2 py-1 rounded">조합 {currentIndex + 1} / {combinations.length}</span>
+                                                    </div>
+                                                    
+                                                    <div className="space-y-4">
+                                                        {combo.groups.map((group, i) => (
+                                                            <div key={i} className={`p-3 rounded-lg border ${group.isWide ? 'bg-red-950/40 border-red-800' : 'bg-slate-900/80 border-emerald-700/60'}`}>
+                                                                <div className="flex justify-between items-center mb-3 border-b border-slate-700 pb-2">
+                                                                    <div className="flex flex-col">
+                                                                        <span className="font-bold text-sm">TEAM {i + 1} <span className="font-normal text-slate-400">({group.size}인큐)</span></span>
+                                                                        {group.isWide && <span className="text-[10px] text-red-400 font-bold mt-1">{group.reason}</span>}
+                                                                    </div>
+                                                                    <span className={`px-2 py-1 rounded text-[10px] font-black tracking-wider ${group.isWide ? 'bg-red-600' : 'bg-emerald-600'}`}>
+                                                                        {group.isWide ? 'WIDE' : 'NARROW'}
+                                                                    </span>
+                                                                </div>
+
+                                                                <div className="space-y-1.5 mb-3">
+                                                                    {group.members.map((m, j) => (
+                                                                        <div key={j} className="flex justify-between items-center text-sm">
+                                                                            <span className="font-bold text-slate-300">{m.player.name}</span>
+                                                                            <div className="flex items-center gap-2 text-xs">
+                                                                                <span className="text-slate-500 hidden sm:inline-block">{getTierName(m.score)}</span>
+                                                                                <span className={`p-1 rounded bg-slate-800 border border-slate-700 ${m.assignedRole === '탱커' ? 'text-blue-400' : m.assignedRole === '딜러' ? 'text-red-400' : m.assignedRole === '힐러' ? 'text-emerald-400' : 'text-red-600 font-bold'}`}>
+                                                                                    {m.assignedRole === '탱커' && <IconTank/>}
+                                                                                    {m.assignedRole === '딜러' && <IconDPS/>}
+                                                                                    {m.assignedRole === '힐러' && <IconHeal/>}
+                                                                                    {m.assignedRole === '포지션 불가' && '불가'}
+                                                                                </span>
+                                                                            </div>
+                                                                        </div>
+                                                                    ))}
+                                                                </div>
+                                                            </div>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                            );
+                                        })()
+                                    ) : (
+                                        <div className="flex items-center justify-center h-full border-2 border-dashed border-slate-700 rounded-xl text-slate-500 text-sm p-8 text-center bg-slate-800/30">
+                                            좌측에서 인원과 티어를 설정한 후<br/>'탐색하기' 버튼을 눌러주세요.
+                                        </div>
+                                    )
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
